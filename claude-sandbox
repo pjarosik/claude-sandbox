@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# Run Claude Code inside a docker container that sees only:
+#   - the current working directory (rw, same path)
+#   - ~/.claude and ~/.claude.json (rw: login, settings, sessions, IDE lockfiles)
+#   - ~/.gitconfig (ro), the claude install (ro)
+#   - the directories listed in mounts.conf
+# All arguments are passed to claude unchanged, so this is a drop-in
+# replacement for `claude` (it is what Emacs' claude-code-ide runs).
+#
+# The image is (re)built automatically when the Dockerfile changes.
+# Set CLAUDE_SANDBOX_REBUILD=1 to force a rebuild (e.g. to pick up new apt
+# packages).
+set -euo pipefail
+
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+image="claude-sandbox:latest"
+mounts_file="${CLAUDE_SANDBOX_MOUNTS:-$here/mounts.conf}"
+
+die() { echo "claude-sandbox: $*" >&2; exit 1; }
+warn() { echo "claude-sandbox: $*" >&2; }
+
+# --- image -------------------------------------------------------------------
+dockerfile_hash="$(sha256sum "$here/Dockerfile" | cut -c1-16)"
+image_hash="$(docker image inspect -f '{{index .Config.Labels "dockerfile-hash"}}' \
+                "$image" 2>/dev/null || true)"
+if [[ "$image_hash" != "$dockerfile_hash" || -n "${CLAUDE_SANDBOX_REBUILD:-}" ]]; then
+    warn "building $image ..."
+    docker build >&2 \
+        --label "dockerfile-hash=$dockerfile_hash" \
+        --build-arg USER_NAME="$(id -un)" \
+        --build-arg USER_UID="$(id -u)" \
+        --build-arg USER_GID="$(id -g)" \
+        --build-arg USER_HOME="$HOME" \
+        -t "$image" "$here" || die "docker build failed"
+fi
+
+# --- claude binary -----------------------------------------------------------
+claude_bin="$(readlink -f "$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")")"
+[[ -x "$claude_bin" ]] || die "host claude install not found"
+claude_share="$HOME/.local/share/claude"
+[[ "$claude_bin" == "$claude_share"/* ]] \
+    || die "expected claude under $claude_share, found $claude_bin"
+
+# --- mounts ------------------------------------------------------------------
+cwd="$(pwd -P)"
+case "$cwd" in
+    "$HOME"|/|/home|/etc|/usr|/var|/root) die "refusing to mount $cwd as the working directory";;
+esac
+
+touch "$HOME/.claude.json"
+mkdir -p "$HOME/.claude"
+
+declare -A mounted=()   # container path -> host path
+mount_args=()
+add_mount() {  # add_mount <host path> <container path> <rw|ro>
+    local src="$1" dst="$2" mode="$3" opts=""
+    if [[ -n "${mounted[$dst]:-}" ]]; then
+        if [[ "${mounted[$dst]}" != "$src" ]]; then
+            warn "$dst is already mounted from ${mounted[$dst]}, ignoring $src"
+        fi
+        return 0
+    fi
+    mounted[$dst]="$src"
+    if [[ $mode == ro ]]; then opts=",readonly"; fi
+    mount_args+=(--mount "type=bind,source=$src,target=$dst$opts")
+}
+
+# Lines of a mounts file: <host>[:<container>][:ro|:rw]. See mounts.conf.
+read_mounts_file() {  # read_mounts_file <file>
+    local file="$1" line src dst mode
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [[ -z "$line" ]]; then continue; fi
+        mode=rw
+        case "$line" in
+            *:ro) mode=ro; line="${line%:ro}";;
+            *:rw) line="${line%:rw}";;
+        esac
+        src="${line%%:*}"
+        dst=""
+        if [[ "$line" == *:* ]]; then dst="${line#*:}"; fi
+        src="${src/#\~/$HOME}"
+        dst="${dst/#\~/$HOME}"
+        if [[ "$src" != /* ]]; then src="$(dirname "$file")/$src"; fi
+        if [[ ! -e "$src" ]]; then
+            warn "$file: skipping missing $src"
+            continue
+        fi
+        src="$(readlink -f "$src")"
+        if [[ -z "$dst" ]]; then dst="$src"; fi
+        if [[ "$dst" != /* || "$dst" == / ]]; then
+            warn "$file: container path must be absolute and not /: $dst"
+            continue
+        fi
+        add_mount "$src" "${dst%/}" "$mode"
+    done < "$file"
+}
+
+# The project's own .claude-sandbox-mounts is writable from inside the
+# sandbox, so it is used only once approved here, on the host: on first sight
+# and after every change. Approvals (content hash + path) live outside
+# everything the container can see.
+project_mounts_approved() {  # project_mounts_approved <file>
+    local file="$1" approvals sum answer
+    approvals="${XDG_CONFIG_HOME:-$HOME/.config}/claude-sandbox/approved-mounts"
+    sum="$(sha256sum "$file" | cut -d' ' -f1)"
+    if grep -qxF "$sum $file" "$approvals" 2>/dev/null; then return 0; fi
+    if [[ ! -t 0 || ! -t 2 ]]; then
+        warn "ignoring unapproved $file (run claude-sandbox in a terminal to approve it)"
+        return 1
+    fi
+    {
+        echo "claude-sandbox: $file is new or has changed:"
+        sed 's/^/    /' "$file"
+    } >&2
+    read -r -p "claude-sandbox: mount these into the sandbox? [y/N] " answer
+    if [[ "$answer" != [yY]* ]]; then
+        warn "not mounting $file"
+        return 1
+    fi
+    mkdir -p "$(dirname "$approvals")"
+    echo "$sum $file" >> "$approvals"
+}
+
+add_mount "$cwd" "$cwd" rw
+add_mount "$HOME/.claude" "$HOME/.claude" rw
+add_mount "$HOME/.claude.json" "$HOME/.claude.json" rw
+add_mount "$claude_share" "$claude_share" ro
+if [[ -f "$HOME/.gitconfig" ]]; then add_mount "$HOME/.gitconfig" "$HOME/.gitconfig" ro; fi
+
+# The project's file is read first, so it wins over mounts.conf for a
+# container path both of them map.
+project_mounts="$cwd/.claude-sandbox-mounts"
+if [[ -f "$project_mounts" ]] && project_mounts_approved "$project_mounts"; then
+    read_mounts_file "$project_mounts"
+fi
+if [[ -f "$mounts_file" ]]; then read_mounts_file "$mounts_file"; fi
+
+# eat (the Emacs terminal) sets TERM=eat-* and points TERMINFO at its own
+# terminfo database; make that visible so TERM resolves inside the container.
+if [[ -n "${TERMINFO:-}" && -d "$TERMINFO" ]]; then
+    terminfo="$(readlink -f "$TERMINFO")"
+    add_mount "$terminfo" "$terminfo" ro
+fi
+
+if [[ -n "${CLAUDE_SANDBOX_SHOW_MOUNTS:-}" ]]; then
+    for dst in "${!mounted[@]}"; do echo "${mounted[$dst]} -> $dst"; done | sort
+    exit 0
+fi
+
+# --- environment -------------------------------------------------------------
+env_args=(-e HOME="$HOME" -e USER="$(id -un)" -e DISABLE_AUTOUPDATER=1
+          -e PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+for v in TERM COLORTERM TERMINFO TERM_PROGRAM TERM_PROGRAM_VERSION LANG LC_ALL TZ \
+         FORCE_CODE_TERMINAL EDITOR VISUAL; do
+    if [[ -n "${!v:-}" ]]; then env_args+=(-e "$v=${!v}"); fi
+done
+# Everything Claude-specific: CLAUDE_CODE_SSE_PORT (the Emacs IDE connection),
+# CLAUDE_CODE_NO_FLICKER, ANTHROPIC_* overrides, ...
+while IFS='=' read -r name _; do
+    if [[ "$name" =~ ^(CLAUDE_|ANTHROPIC_|ENABLE_IDE_INTEGRATION$) &&
+          ! "$name" =~ ^(CLAUDE_SANDBOX_|CLAUDE_PATH$) ]]; then
+        env_args+=(-e "$name")
+    fi
+done < <(env)
+
+# seccomp.json is docker 20.10.12's default profile plus an unrestricted
+# `personality` syscall: SBCL (maxima) needs ADDR_NO_RANDOMIZE and segfaults
+# under the stock profile.
+tty_args=(-i)
+if [[ -t 0 && -t 1 ]]; then tty_args+=(-t); fi
+
+exec docker run --rm --init "${tty_args[@]}" \
+    --network host \
+    --hostname claude-sandbox \
+    --security-opt no-new-privileges \
+    --security-opt seccomp="$here/seccomp.json" \
+    --cap-drop ALL \
+    "${mount_args[@]}" \
+    "${env_args[@]}" \
+    -w "$cwd" \
+    "$image" \
+    "$claude_bin" "$@"
